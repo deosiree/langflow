@@ -33,6 +33,7 @@ OLD = importlib.import_module("langflow.alembic.versions.df1410b1eefa_add_audit_
 NEW = importlib.import_module("langflow.alembic.versions.a6f81c2d903b_add_represented_audit_identity")
 ROTATION = importlib.import_module("langflow.alembic.versions.c6a81d3e9502_secret_rotation_receipt")
 MERGE = importlib.import_module("langflow.alembic.versions.b6c84e92a0f1_merge_audit_identity_and_secret_rotation")
+RELEASE_MERGE = importlib.import_module("langflow.alembic.versions.d8e9f0a1b2c3_merge_represented_identity_and_release")
 RELEASE = importlib.import_module("langflow.alembic.versions.1d8d193028c8_add_trigger_admin_paused_at")
 
 
@@ -99,8 +100,10 @@ def test_alembic_upgrade_from_both_release_predecessors(db_url, tmp_path, predec
             conn.execute(_event(table, acting_issuer="existing", acting_subject="history"))
             config = _alembic_config(tmp_path, conn)
             command.stamp(config, predecessor)
-            command.upgrade(config, "head")
-            command.upgrade(config, "head")
+            # This minimal schema covers the audit branch. Later release
+            # revisions also require unrelated application tables.
+            command.upgrade(config, MERGE.revision)
+            command.upgrade(config, MERGE.revision)
             assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == MERGE.revision
             assert "admin_paused_at" in {column["name"] for column in sa.inspect(conn).get_columns("trigger")}
             assert sa.inspect(conn).has_table("secret_rotation")
@@ -193,7 +196,15 @@ def test_maximum_unicode_identity_commits_with_mutation(db_url, schema, prefix):
         engine.dispose()
 
 
-@pytest.mark.parametrize("draft_revision", [None, "a6f81c2d903b", "c8f3e6a2b901", "d9a2c7e4f610"])
+@pytest.mark.parametrize(
+    "draft_revision",
+    [
+        None,
+        NEW.revision,
+        "c8f3e6a2b901",  # pragma: allowlist secret
+        "d9a2c7e4f610",  # pragma: allowlist secret
+    ],
+)
 def test_bounded_indexes_repair_draft_shapes_without_changing_history(db_url, tmp_path, draft_revision):  # noqa: F811
     """Repair draft schemas, with an explicit stamp transition for previously applied drafts."""
     engine = sa.create_engine(_engine_url(db_url))
@@ -230,7 +241,7 @@ def test_bounded_indexes_repair_draft_shapes_without_changing_history(db_url, tm
                 # checking its schema, explicitly restamp the common ancestor
                 # so the earliest draft also applies the release trigger change.
                 command.stamp(config, RELEASE.down_revision, purge=True)
-                command.upgrade(config, "head")
+                command.upgrade(config, MERGE.revision)
                 assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == MERGE.revision
                 assert "admin_paused_at" in {column["name"] for column in sa.inspect(conn).get_columns("trigger")}
             else:
@@ -270,13 +281,34 @@ def test_upgrade_completes_partial_draft_schema(db_url, column):  # noqa: F811
         engine.dispose()
 
 
+def test_release_merge_preserves_audit_history(db_url, tmp_path):  # noqa: F811
+    """Join installed release and audit branches without changing stored events."""
+    engine = sa.create_engine(_engine_url(db_url))
+    try:
+        with engine.begin() as conn:
+            _upgrade(OLD, conn)
+            _upgrade(NEW, conn)
+            table = sa.Table("audit_events", sa.MetaData(), autoload_with=conn)
+            conn.execute(_event(table, represented_issuer="issuer", represented_subject="subject"))
+            before = list(conn.execute(sa.select(table)))
+            config = _alembic_config(tmp_path, conn)
+            command.stamp(config, list(RELEASE_MERGE.down_revision))
+            command.upgrade(config, "head")
+            command.upgrade(config, "head")
+            assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == RELEASE_MERGE.revision
+            assert list(conn.execute(sa.select(table))) == before
+    finally:
+        engine.dispose()
+
+
 def test_represented_identity_and_release_migrations_have_one_head():
     """Join the additive audit and release migrations without rewriting either."""
     scripts = ScriptDirectory(str(Path(NEW.__file__).resolve().parents[1]))
     head = scripts.get_current_head()
     assert head is not None
     revisions = {revision.revision for revision in scripts.iterate_revisions(head, "base")}
-    assert head == MERGE.revision
+    assert head == RELEASE_MERGE.revision
+    assert set(RELEASE_MERGE.down_revision) == {MERGE.revision, "f4b8c1d2e3a6"}  # pragma: allowlist secret
     assert set(MERGE.down_revision) == {NEW.revision, ROTATION.revision}
     assert ROTATION.revision in revisions
     assert NEW.down_revision == "1d8d193028c8"  # pragma: allowlist secret
