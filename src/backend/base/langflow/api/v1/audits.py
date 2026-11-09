@@ -13,6 +13,7 @@ import csv
 import io
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
@@ -30,6 +31,7 @@ from langflow.api.v1.audit_reads import (
     parse_limit,
     parse_timestamp,
     parse_uuid,
+    validate_identity_filter,
 )
 from langflow.services.audit.feed import (
     FEED_RESULTS,
@@ -68,7 +70,7 @@ _ENUM_LISTS: dict[str, frozenset[str]] = {
 }
 _REPEATABLE = frozenset({*_SLUG_LISTS, *_ACTION_LISTS, *_ENUM_LISTS})
 _UUIDS = ("resource_id", "user_id", "actor_id", "request_id")
-_FILTER_PARAMS = frozenset({*_REPEATABLE, *_UUIDS, "since", "until", "q"})
+_FILTER_PARAMS = frozenset({*_REPEATABLE, *_UUIDS, "represented_issuer", "represented_subject", "since", "until", "q"})
 _PAGE_PARAMS = frozenset({"cursor", "limit", "offset", "include_total"})
 MAX_FEED_OFFSET = 1_000_000
 _EXPORT_FORMATS = {"csv": "text/csv; charset=utf-8", "ndjson": "application/x-ndjson"}
@@ -90,6 +92,9 @@ CSV_COLUMNS = (
     "operation",
     "error_code",
     "request_id",
+    "id",
+    "represented_issuer",
+    "represented_subject",
 )
 
 
@@ -126,6 +131,7 @@ def _filters(grouped: dict[str, list[str]]) -> AuditFeedFilters:
     single = {key: values[0] for key, values in grouped.items() if key not in _REPEATABLE}
     lists = {key: _repeatable_values(key, values) for key, values in grouped.items() if key in _REPEATABLE}
     uuids = {key: parse_uuid(key, single[key]) for key in _UUIDS if key in single}
+    validate_identity_filter(single, "represented")
     since, until = _window(single)
     return AuditFeedFilters(
         sources=frozenset(AuditSource(value) for value in lists.get("source", ())),
@@ -140,6 +146,8 @@ def _filters(grouped: dict[str, list[str]]) -> AuditFeedFilters:
         user_id=uuids.get("user_id"),
         actor_id=uuids.get("actor_id"),
         request_id=uuids.get("request_id"),
+        represented_issuer=single.get("represented_issuer"),
+        represented_subject=single.get("represented_subject"),
         since=since,
         until=until,
         search=_search(single),
@@ -292,6 +300,8 @@ def _openapi_parameters(*, export: bool) -> list[dict[str, Any]]:
         param("user_id", "Exact Langflow account.", uuid_schema),
         param("actor_id", "Exact authenticated principal or credential.", uuid_schema),
         param("request_id", "Exact request correlation id.", uuid_schema),
+        param("represented_subject", "Exact represented-user subject.", {"type": "string"}),
+        param("represented_issuer", "Represented-user issuer. Requires represented_subject.", {"type": "string"}),
         param("since", "Inclusive RFC 3339 timestamp.", timestamp_schema),
         param("until", "Exclusive RFC 3339 timestamp, later than since.", timestamp_schema),
         param(
@@ -367,7 +377,9 @@ def _stable_json(value: dict[str, Any] | None) -> str:
 def _csv_cell(value: object) -> str:
     """Neutralize spreadsheet formulas; the csv writer does the RFC 4180 quoting."""
     text = "" if value is None else str(value)
-    first_visible = text.lstrip("\x00\t\n\r ")[:1]
+    first_visible = next(
+        (char for char in text if not char.isspace() and unicodedata.category(char) not in {"Cc", "Cf"}), ""
+    )
     return f"'{text}" if first_visible and first_visible in "=+-@" else text
 
 
@@ -391,6 +403,9 @@ def _csv_values(feed_row: AuditFeedRow) -> list[object]:
         row.operation if is_resource else None,
         row.error_code if is_resource else None,
         _request_id(feed_row),
+        row.id,
+        row.represented_issuer if is_resource else None,
+        row.represented_subject if is_resource else None,
     ]
 
 
