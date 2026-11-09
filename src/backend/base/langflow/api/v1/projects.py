@@ -72,6 +72,7 @@ from langflow.services.audit.operations import (
     stage_project_succeeded,
 )
 from langflow.services.audit.writer import batch_audit_events, flush_audit_event_batch
+from langflow.services.auth.context import current_auth_is_restricted_api_key
 from langflow.services.auth.mcp_encryption import encrypt_auth_settings
 from langflow.services.authorization import (
     FlowAction,
@@ -723,7 +724,7 @@ async def read_project(
         # caller (i.e. reached via a share grant), show all flows in the
         # project — the share grant on the project implies access to its
         # contents. Otherwise keep the existing owner-scoped flow filter.
-        treat_as_shared = share_aware and project.user_id != current_user.id
+        treat_as_shared = share_aware and (project.user_id != current_user.id or current_auth_is_restricted_api_key())
 
         # DB-layer authz prefilter for the project's flows. Only meaningful for
         # shared-project reads (owner reads are already owner-scoped and run no
@@ -815,13 +816,13 @@ async def read_project(
                 visible_flows = [
                     flow
                     for flow in project.flows
-                    if flow.user_id == current_user.id
-                    or resource_visible_in_scope(
+                    if resource_visible_in_scope(
                         resource_id=flow.id,
                         workspace_id=project.workspace_id,
                         project_id=flow.folder_id,
                         project_is_personal=project.is_personal,
                         visibility=visibility_scope,
+                        is_owner=flow.user_id == current_user.id,
                     )
                 ]
             else:
